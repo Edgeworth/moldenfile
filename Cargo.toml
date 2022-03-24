@@ -1,0 +1,25 @@
+[package]
+authors = ["E <edgeworth.dev@gmail.com>"]
+categories = ["development-tools"]
+description = "test golden file library"
+edition = "2021"
+keywords = ["golden", "test"]
+license = "MIT OR Apache-2.0"
+name = "moldenfile"
+repository = "https://github.com/Edgeworth/moldenfile"
+version = "0.1.0"
+
+[dependencies]
+colored = "2.0.0"
+dissimilar = "1.0.3"
+eyre = "0.6.7"
+flate2 = "1.0.22"
+tempfile = "3.3.0"
+
+# Build dependencies with optimisations - debug builds will run faster
+# but dependencies don't change often.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
