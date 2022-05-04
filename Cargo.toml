@@ -11,15 +11,7 @@ version = "0.1.0"
 
 [dependencies]
 colored = "2.0.0"
-dissimilar = "1.0.3"
-eyre = "0.6.7"
-flate2 = "1.0.22"
+dissimilar = "1.0.4"
+eyre = "0.6.8"
+flate2 = "1.0.23"
 tempfile = "3.3.0"
-
-# Build dependencies with optimisations - debug builds will run faster
-# but dependencies don't change often.
-[profile.dev.package."*"]
-opt-level = 3
-
-[profile.release]
-lto = true
