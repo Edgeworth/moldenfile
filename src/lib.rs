@@ -50,6 +50,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use tempfile::{tempdir, TempDir};
 
+#[must_use]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum CursorOp {
     Equal,
@@ -57,6 +58,7 @@ enum CursorOp {
     Insert,
 }
 
+#[must_use]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct Cursor<'a> {
     idx: usize,
@@ -108,6 +110,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
+#[must_use]
 #[derive(Debug)]
 pub struct Golden {
     golden: PathBuf,
@@ -170,8 +173,8 @@ impl Golden {
 
     fn verify(&self) -> Result<()> {
         for p in &self.paths {
-            let mut golden = Self::read(&self.golden.join(&p))?;
-            let mut actual = Self::read(&self.tmp.path().join(&p))?;
+            let mut golden = Self::read(&self.golden.join(p))?;
+            let mut actual = Self::read(&self.tmp.path().join(p))?;
 
             // Process in chunks of |BYTE_LIMIT|.
             loop {
@@ -203,7 +206,7 @@ impl Golden {
 
     fn update(&self) -> Result<()> {
         for p in &self.paths {
-            fs::copy(&self.tmp.path().join(&p), &self.golden.join(&p))?;
+            fs::copy(self.tmp.path().join(p), self.golden.join(p))?;
         }
         Ok(())
     }
