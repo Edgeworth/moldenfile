@@ -2,7 +2,7 @@
 authors = ["E <edgeworth.dev@gmail.com>"]
 categories = ["development-tools"]
 description = "test golden file library"
-edition = "2021"
+edition = "2024"
 keywords = ["golden", "test"]
 license = "MIT OR Apache-2.0"
 name = "moldenfile"
@@ -10,8 +10,8 @@ repository = "https://github.com/Edgeworth/moldenfile"
 version = "0.1.0"
 
 [dependencies]
-colored = "2.0.0"
-dissimilar = "1.0.6"
-eyre = "0.6.8"
-flate2 = "1.0.26"
-tempfile = "3.5.0"
+colored = "3.0.0"
+dissimilar = "1.0.9"
+eyre = "0.6.12"
+flate2 = "1.0.35"
+tempfile = "3.17.1"
