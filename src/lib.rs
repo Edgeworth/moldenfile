@@ -43,12 +43,12 @@ use std::path::{Path, PathBuf};
 use std::{env, thread};
 
 use colored::Colorize;
-use dissimilar::{diff, Chunk};
-use eyre::{eyre, Result};
+use dissimilar::{Chunk, diff};
+use eyre::{Result, eyre};
+use flate2::Compression;
 use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 
 #[must_use]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
