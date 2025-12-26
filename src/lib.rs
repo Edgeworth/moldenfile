@@ -36,9 +36,9 @@
     clippy::unreadable_literal
 )]
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::{env, thread};
 
 use colored::Colorize;
@@ -110,27 +110,49 @@ impl<'a> Cursor<'a> {
 }
 
 #[must_use]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum GoldenMode {
+    VerifyOnDrop,
+    UpdateOnDrop,
+    DoNothing,
+}
+
+#[must_use]
 #[derive(Debug)]
 pub struct Golden {
-    golden: PathBuf,
+    dir: PathBuf,
     tmp: TempDir,
     paths: Vec<PathBuf>,
+    mode: GoldenMode,
 }
 
 const BYTE_LIMIT: u64 = 1024;
 
 impl Golden {
     pub fn new(p: impl AsRef<Path>) -> Result<Self> {
-        Ok(Self { golden: p.as_ref().to_path_buf(), tmp: tempdir()?, paths: Vec::new() })
+        let mode = match env::var("UPDATE_GOLDEN").as_deref() {
+            Ok("1") => GoldenMode::UpdateOnDrop,
+            _ => GoldenMode::VerifyOnDrop,
+        };
+        Self::new_with_mode(p, mode)
     }
 
-    pub fn file(&mut self, p: impl AsRef<Path>) -> Result<Box<dyn Write>> {
+    pub fn new_with_mode(p: impl AsRef<Path>, mode: GoldenMode) -> Result<Self> {
+        Ok(Self { dir: p.as_ref().to_path_buf(), tmp: tempdir()?, paths: Vec::new(), mode })
+    }
+
+    pub fn file(&mut self, p: impl AsRef<Path>) -> Result<Box<dyn Write + '_>> {
         self.write_tmp(p.as_ref())
     }
 
-    fn write_tmp(&mut self, p: &Path) -> Result<Box<dyn Write>> {
+    fn write_tmp(&mut self, p: &Path) -> Result<Box<dyn Write + '_>> {
+        Self::validate_rel_path(p)?;
+        let tmp_path = self.tmp.path().join(p);
+        if let Some(parent) = tmp_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let f = BufWriter::new(File::create(&tmp_path)?);
         self.paths.push(p.to_owned());
-        let f = BufWriter::new(File::create(self.tmp.path().join(p))?);
         if p.extension().unwrap_or_default() == "gz" {
             Ok(Box::new(GzEncoder::new(f, Compression::best())))
         } else {
@@ -149,7 +171,7 @@ impl Golden {
 
     fn process_diffs(old: &str, new: &str) -> usize {
         let chunks = diff(old, new);
-        let mut okay_count = 0;
+        let mut diff_count = 0;
         let mut old = Cursor::new(old);
         let mut new = Cursor::new(new);
         for chunk in &chunks {
@@ -157,22 +179,27 @@ impl Golden {
                 Chunk::Equal(s) => {
                     old.advance(s.len(), CursorOp::Equal, true);
                     new.advance(s.len(), CursorOp::Equal, false); // Don't double print for equal chunks.
-                    okay_count += 1;
                 }
-                Chunk::Delete(s) => old.advance(s.len(), CursorOp::Delete, true),
-                Chunk::Insert(s) => new.advance(s.len(), CursorOp::Insert, false),
+                Chunk::Delete(s) => {
+                    diff_count += 1;
+                    old.advance(s.len(), CursorOp::Delete, true);
+                }
+                Chunk::Insert(s) => {
+                    diff_count += 1;
+                    new.advance(s.len(), CursorOp::Insert, false);
+                }
             }
         }
-        let num = chunks.len() - okay_count;
-        if num != 0 {
+        if diff_count != 0 {
             println!();
         }
-        num
+        diff_count
     }
 
     fn verify(&self) -> Result<()> {
         for p in &self.paths {
-            let mut golden = Self::read(&self.golden.join(p))?;
+            let golden_path = self.dir.join(p);
+            let mut golden = Self::read(&golden_path)?;
             let mut actual = Self::read(&self.tmp.path().join(p))?;
 
             // Process in chunks of |BYTE_LIMIT|.
@@ -203,9 +230,40 @@ impl Golden {
         Ok(())
     }
 
+    fn validate_rel_path(p: &Path) -> Result<()> {
+        if p.as_os_str().is_empty() {
+            return Err(eyre!("invalid golden path (must be non-empty)"));
+        }
+
+        let mut last_component = None;
+        for c in p.components() {
+            last_component = Some(c);
+            match c {
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                    return Err(eyre!(
+                        "invalid golden path (must be relative without '..'): {}",
+                        p.display()
+                    ));
+                }
+                Component::CurDir | Component::Normal(_) => {}
+            }
+        }
+
+        if matches!(last_component, Some(Component::CurDir)) {
+            return Err(eyre!("invalid golden path (must not end with '.'): {}", p.display()));
+        }
+        Ok(())
+    }
+
     fn update(&self) -> Result<()> {
         for p in &self.paths {
-            fs::copy(self.tmp.path().join(p), self.golden.join(p))?;
+            Self::validate_rel_path(p)?;
+            let src = self.tmp.path().join(p);
+            let dst = self.dir.join(p);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(src, dst)?;
         }
         Ok(())
     }
@@ -216,11 +274,175 @@ impl Drop for Golden {
         if thread::panicking() {
             return;
         }
-        let r = env::var("UPDATE_GOLDEN");
-        if r.is_ok() && r.unwrap() == "1" {
-            self.update().expect("could not update golden files");
-        } else {
-            self.verify().expect("could not verify golden files");
+        match self.mode {
+            GoldenMode::UpdateOnDrop => {
+                self.update().expect("could not update golden files");
+            }
+            GoldenMode::VerifyOnDrop => {
+                self.verify().expect("could not verify golden files");
+            }
+            GoldenMode::DoNothing => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Write as _;
+
+    use super::*;
+
+    fn new_golden_dir() -> Result<(TempDir, PathBuf)> {
+        let tmp = tempdir()?;
+        let golden_path = tmp.path().join("golden");
+        std::fs::create_dir(&golden_path)?;
+        Ok((tmp, golden_path))
+    }
+
+    fn write_gz(path: &Path, content: &[u8]) -> Result<()> {
+        let file = File::create(path)?;
+        let mut encoder = GzEncoder::new(file, Compression::best());
+        encoder.write_all(content)?;
+        encoder.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_diffs() {
+        let content = "identical content\nwith lines\n";
+        assert_eq!(Golden::process_diffs(content, content), 0);
+
+        let old = "The quick brown fox\njumps over\nthe lazy dog";
+        let new = "The quick red fox\nleaps over\nthe lazy dog";
+        assert!(Golden::process_diffs(old, new) > 0);
+    }
+
+    #[test]
+    fn test_read_plain_and_gz() -> Result<()> {
+        let tmp = tempdir()?;
+        let plain_path = tmp.path().join("test.txt");
+        let gz_path = tmp.path().join("test.txt.gz");
+
+        std::fs::write(&plain_path, "test content")?;
+        write_gz(&gz_path, b"compressed")?;
+
+        for (path, expected) in [(&plain_path, "test content"), (&gz_path, "compressed")] {
+            let mut reader = Golden::read(path)?;
+            let mut content = String::new();
+            reader.read_to_string(&mut content)?;
+            assert_eq!(content, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_plain_and_gz() -> Result<()> {
+        let (_tmp, golden_path) = new_golden_dir()?;
+
+        std::fs::write(golden_path.join("match.txt"), "content")?;
+        std::fs::write(golden_path.join("empty.txt"), "")?;
+        write_gz(golden_path.join("match.txt.gz").as_path(), b"compressed content")?;
+
+        let mut golden = Golden::new_with_mode(&golden_path, GoldenMode::DoNothing)?;
+        write!(golden.file("match.txt")?, "content")?;
+        drop(golden.file("empty.txt")?);
+        write!(golden.file("match.txt.gz")?, "compressed content")?;
+        assert!(golden.verify().is_ok());
+
+        let mut golden = Golden::new_with_mode(&golden_path, GoldenMode::DoNothing)?;
+        write!(golden.file("match.txt")?, "modified")?;
+        assert!(golden.verify().is_err());
+
+        let mut golden = Golden::new_with_mode(&golden_path, GoldenMode::DoNothing)?;
+        write!(golden.file("missing.txt")?, "content")?;
+        assert!(golden.verify().is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_chunk_boundary_difference() -> Result<()> {
+        let (_tmp, golden_path) = new_golden_dir()?;
+
+        let mut old_content = String::new();
+        for i in 0..80 {
+            writeln!(old_content, "Line {i} identical")?;
+        }
+        let mut new_content = old_content.clone();
+        old_content.push_str("old content here");
+        new_content.push_str("new content here");
+
+        std::fs::write(golden_path.join("diff_chunk2.txt"), &old_content)?;
+
+        let mut golden = Golden::new_with_mode(&golden_path, GoldenMode::DoNothing)?;
+        write!(golden.file("diff_chunk2.txt")?, "{new_content}")?;
+        assert!(golden.verify().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_creates_files_and_dirs() -> Result<()> {
+        let (_tmp, golden_path) = new_golden_dir()?;
+        let mut golden = Golden::new_with_mode(&golden_path, GoldenMode::DoNothing)?;
+
+        write!(golden.file("new.txt")?, "new content")?;
+        write!(golden.file("subdir/test.txt")?, "nested content")?;
+        golden.update()?;
+
+        assert_eq!(std::fs::read_to_string(golden_path.join("new.txt"))?, "new content");
+        assert_eq!(std::fs::read_to_string(golden_path.join("subdir/test.txt"))?, "nested content");
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_on_drop() -> Result<()> {
+        let (_tmp, golden_path) = new_golden_dir()?;
+
+        std::fs::write(golden_path.join("test.txt"), "old content")?;
+
+        {
+            let mut golden = Golden::new_with_mode(&golden_path, GoldenMode::UpdateOnDrop)?;
+            let mut file = golden.file("test.txt")?;
+            write!(file, "new content")?;
+            drop(file);
+            // Golden dropped at end of scope and should update the file.
+        }
+
+        let updated_content = std::fs::read_to_string(golden_path.join("test.txt"))?;
+        assert_eq!(updated_content, "new content");
+        Ok(())
+    }
+
+    #[test]
+    fn test_do_nothing_mode_does_not_update_or_verify() -> Result<()> {
+        let (_tmp, golden_path) = new_golden_dir()?;
+
+        std::fs::write(golden_path.join("test.txt"), "original")?;
+
+        {
+            let mut golden = Golden::new_with_mode(&golden_path, GoldenMode::DoNothing)?;
+            let mut file = golden.file("test.txt")?;
+            write!(file, "modified")?;
+            drop(file);
+            // Drop should not verify or update.
+        }
+
+        let updated_content = std::fs::read_to_string(golden_path.join("test.txt"))?;
+        assert_eq!(updated_content, "original");
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_rel_path_cases() {
+        let abs = if cfg!(windows) {
+            PathBuf::from(r"C:\escape.txt")
+        } else {
+            PathBuf::from("/escape.txt")
+        };
+
+        for p in [Path::new("../escape.txt"), Path::new(""), Path::new("."), &abs] {
+            assert!(Golden::validate_rel_path(p).is_err());
+        }
+        assert!(Golden::validate_rel_path(Path::new("./subdir/test.txt")).is_ok());
     }
 }
