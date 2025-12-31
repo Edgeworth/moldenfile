@@ -37,17 +37,32 @@
 )]
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 use std::{env, thread};
 
 use colored::Colorize;
 use dissimilar::{Chunk, diff};
-use eyre::{Result, eyre};
 use flate2::Compression;
-use flate2::bufread::GzDecoder;
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use tempfile::{TempDir, tempdir};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error("invalid golden path ({reason}): {path}")]
+    InvalidGoldenPath { reason: &'static str, path: PathBuf },
+
+    #[error(
+        "found at least {differences} difference(s) in {path}! Set UPDATE_GOLDEN=1 to update golden files."
+    )]
+    Differences { differences: usize, path: PathBuf },
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[must_use]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -126,7 +141,7 @@ pub struct Golden {
     mode: GoldenMode,
 }
 
-const BYTE_LIMIT: u64 = 1024;
+const LINE_CHUNK_LIMIT: usize = 20;
 
 impl Golden {
     pub fn new(p: impl AsRef<Path>) -> Result<Self> {
@@ -160,12 +175,12 @@ impl Golden {
         }
     }
 
-    fn read(p: &Path) -> Result<Box<dyn Read>> {
-        let f = BufReader::new(File::open(p)?);
+    fn read(p: &Path) -> Result<Box<dyn BufRead>> {
+        let f = File::open(p)?;
         if p.extension().unwrap_or_default() == "gz" {
-            Ok(Box::new(GzDecoder::new(f)))
+            Ok(Box::new(BufReader::new(GzDecoder::new(f))))
         } else {
-            Ok(Box::new(f))
+            Ok(Box::new(BufReader::new(f)))
         }
     }
 
@@ -196,34 +211,38 @@ impl Golden {
         diff_count
     }
 
+    fn read_line_chunk(reader: &mut impl BufRead, buf: &mut String) -> Result<usize> {
+        buf.clear();
+        let mut lines_read = 0;
+        for _ in 0..LINE_CHUNK_LIMIT {
+            if reader.read_line(buf)? == 0 {
+                break;
+            }
+            lines_read += 1;
+        }
+        Ok(lines_read)
+    }
+
     fn verify(&self) -> Result<()> {
         for p in &self.paths {
             let golden_path = self.dir.join(p);
             let mut golden = Self::read(&golden_path)?;
             let mut actual = Self::read(&self.tmp.path().join(p))?;
 
-            // Process in chunks of |BYTE_LIMIT|.
-            loop {
-                let mut old = String::new();
-                let mut new = String::new();
-                let mut golden_lim = golden.take(BYTE_LIMIT);
-                let mut actual_lim = actual.take(BYTE_LIMIT);
-                golden_lim.read_to_string(&mut old)?;
-                actual_lim.read_to_string(&mut new)?;
-                golden = golden_lim.into_inner();
-                actual = actual_lim.into_inner();
+            let mut old = String::new();
+            let mut new = String::new();
 
-                if old.is_empty() && new.is_empty() {
+            // Process in chunks of |LINE_CHUNK_LIMIT| lines.
+            loop {
+                let old_lines = Self::read_line_chunk(&mut golden, &mut old)?;
+                let new_lines = Self::read_line_chunk(&mut actual, &mut new)?;
+                if old_lines == 0 && new_lines == 0 {
                     break;
                 }
 
                 let num = Self::process_diffs(&old, &new);
                 if num != 0 {
-                    return Err(eyre!(
-                        "Found at least {} difference(s) in {}! Set UPDATE_GOLDEN=1 to update golden files.",
-                        num,
-                        p.display()
-                    ));
+                    return Err(Error::Differences { differences: num, path: p.to_owned() });
                 }
             }
         }
@@ -232,7 +251,10 @@ impl Golden {
 
     fn validate_rel_path(p: &Path) -> Result<()> {
         if p.as_os_str().is_empty() {
-            return Err(eyre!("invalid golden path (must be non-empty)"));
+            return Err(Error::InvalidGoldenPath {
+                reason: "must be non-empty",
+                path: p.to_owned(),
+            });
         }
 
         let mut last_component = None;
@@ -240,17 +262,20 @@ impl Golden {
             last_component = Some(c);
             match c {
                 Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
-                    return Err(eyre!(
-                        "invalid golden path (must be relative without '..'): {}",
-                        p.display()
-                    ));
+                    return Err(Error::InvalidGoldenPath {
+                        reason: "must be relative without '..'",
+                        path: p.to_owned(),
+                    });
                 }
                 Component::CurDir | Component::Normal(_) => {}
             }
         }
 
         if matches!(last_component, Some(Component::CurDir)) {
-            return Err(eyre!("invalid golden path (must not end with '.'): {}", p.display()));
+            return Err(Error::InvalidGoldenPath {
+                reason: "must not end with '.'",
+                path: p.to_owned(),
+            });
         }
         Ok(())
     }
@@ -289,6 +314,7 @@ impl Drop for Golden {
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
+    use std::io::Read as _;
 
     use super::*;
 
@@ -308,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_diffs() {
+    fn process_diffs() {
         let content = "identical content\nwith lines\n";
         assert_eq!(Golden::process_diffs(content, content), 0);
 
@@ -318,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_plain_and_gz() -> Result<()> {
+    fn read_plain_and_gz() -> Result<()> {
         let tmp = tempdir()?;
         let plain_path = tmp.path().join("test.txt");
         let gz_path = tmp.path().join("test.txt.gz");
@@ -336,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_plain_and_gz() -> Result<()> {
+    fn verify_plain_and_gz() -> Result<()> {
         let (_tmp, golden_path) = new_golden_dir()?;
 
         std::fs::write(golden_path.join("match.txt"), "content")?;
@@ -361,16 +387,15 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_chunk_boundary_difference() -> Result<()> {
+    fn verify_chunk_boundary_difference() -> Result<()> {
         let (_tmp, golden_path) = new_golden_dir()?;
 
-        let mut old_content = String::new();
-        for i in 0..80 {
-            writeln!(old_content, "Line {i} identical")?;
+        let mut common = String::new();
+        for i in 0..LINE_CHUNK_LIMIT {
+            writeln!(common, "Line {i} identical").unwrap();
         }
-        let mut new_content = old_content.clone();
-        old_content.push_str("old content here");
-        new_content.push_str("new content here");
+        let old_content = format!("{common}old content here\n");
+        let new_content = format!("{common}new content here\n");
 
         std::fs::write(golden_path.join("diff_chunk2.txt"), &old_content)?;
 
@@ -381,7 +406,29 @@ mod tests {
     }
 
     #[test]
-    fn test_update_creates_files_and_dirs() -> Result<()> {
+    fn verify_processes_three_line_chunks() -> Result<()> {
+        let (_tmp, golden_path) = new_golden_dir()?;
+
+        let total_lines = 3 * LINE_CHUNK_LIMIT;
+        let golden_lines: Vec<String> =
+            (0..total_lines).map(|i| format!("Line {i} identical\n")).collect();
+        let golden_content: String = golden_lines.concat();
+
+        let mut actual_lines = golden_lines;
+        let diff_idx = 2 * LINE_CHUNK_LIMIT;
+        actual_lines[diff_idx] = format!("Line {diff_idx} different\n");
+        let actual_content: String = actual_lines.concat();
+
+        std::fs::write(golden_path.join("diff_three_chunks.txt"), golden_content)?;
+
+        let mut golden = Golden::new_with_mode(&golden_path, GoldenMode::DoNothing)?;
+        write!(golden.file("diff_three_chunks.txt")?, "{actual_content}")?;
+        assert!(golden.verify().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn update_creates_files_and_dirs() -> Result<()> {
         let (_tmp, golden_path) = new_golden_dir()?;
         let mut golden = Golden::new_with_mode(&golden_path, GoldenMode::DoNothing)?;
 
@@ -395,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_on_drop() -> Result<()> {
+    fn update_on_drop() -> Result<()> {
         let (_tmp, golden_path) = new_golden_dir()?;
 
         std::fs::write(golden_path.join("test.txt"), "old content")?;
@@ -414,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn test_do_nothing_mode_does_not_update_or_verify() -> Result<()> {
+    fn do_nothing_mode_does_not_update_or_verify() -> Result<()> {
         let (_tmp, golden_path) = new_golden_dir()?;
 
         std::fs::write(golden_path.join("test.txt"), "original")?;
@@ -433,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rel_path_cases() {
+    fn validate_rel_path_cases() {
         let abs = if cfg!(windows) {
             PathBuf::from(r"C:\escape.txt")
         } else {
